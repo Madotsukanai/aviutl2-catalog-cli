@@ -3,19 +3,39 @@
  * パッケージマネージャー風 CLI (apt / pacman スタイル)
  *
  * 使い方:
- *   au2cat search   <キーワード>          パッケージを検索
- *   au2cat list     [種類]                パッケージ一覧
- *   au2cat show     <id|名前>             パッケージ詳細
- *   au2cat info     <id|名前>             show の別名
- *   au2cat stats                          統計情報
- *   au2cat update                         カタログ更新確認
- *   au2cat help                           このヘルプ
+ *   au2cat search    <キーワード>          パッケージを検索
+ *   au2cat list      [種類]                パッケージ一覧
+ *   au2cat show      <id|名前>             パッケージ詳細
+ *   au2cat info      <id|名前>             show の別名
+ *   au2cat install   <id|名前> [-y]        パッケージをインストール
+ *   au2cat uninstall <id|名前> [-y]        パッケージをアンインストール (remove/rm でも可)
+ *   au2cat config    [--app-dir <path>] [--plugins-dir <path>]
+ *                                          インストール先の設定を表示/変更
+ *   au2cat stats                           統計情報
+ *   au2cat update                          カタログ更新確認
+ *   au2cat help                            このヘルプ
  *
  * ビルド:
- *   Linux/macOS : gcc -O2 -o au2cat main.c -lcurl -lm
- *   Windows     : gcc -O2 -o au2cat.exe main.c -lcurl -lws2_32 -lm
+ *   Linux/macOS : gcc -O2 -o au2cat main.c -lcurl -lzip -lm
+ *   Windows     : gcc -O2 -o au2cat.exe main.c -lcurl -lzip -lws2_32 -lm
  *
- * 依存: libcurl のみ
+ * 依存: libcurl, libzip
+ *
+ * --- install / uninstall について ---
+ * カタログ index.json の "installer" フィールドに従って、ダウンロード ->
+ * (zip)展開 -> ファイルコピー、または exe 実行 (Windows / Wine) を行います。
+ *
+ *   - 対応プラットフォーム: クロスプラットフォーム (zip展開・ファイルコピー
+ *     は全OSで動作)。ただし exe を実行するアクション (run / run_auo_setup /
+ *     extract_sfx) は Windows ネイティブ、または非Windows環境で `wine` が
+ *     PATH 上に見つかった場合のみ実行されます。見つからない場合はそのアク
+ *     ションをスキップして警告を表示します。
+ *   - extract_sfx は 7-Zip SFX 形式を想定し `-o"<dest>" -y` を付与して実行
+ *     するベストエフォート実装です。SFX の実装によっては動作しない場合が
+ *     あります。
+ *   - appDir / pluginsDir (AviUtl2 のインストール先) は ~/au2cat_config.json
+ *     に保存されます。未設定の場合、初回の install/uninstall 実行時に対話
+ *     的に質問します。`au2cat config` で確認・変更できます。
  */
 
 #include <stdio.h>
@@ -23,30 +43,42 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
+#include <sys/stat.h>
+#include <dirent.h>
 #include <curl/curl.h>
+#include <zip.h>
 
 #ifdef _WIN32
 #  include <windows.h>
+#  include <shellapi.h>
 #  include <direct.h>
 #  define PATH_SEP      '\\'
 #  define HOME_ENV      "USERPROFILE"
 #  define MKDIR(p)      _mkdir(p)
+#  define RMDIR(p)      _rmdir(p)
 #else
-#  include <sys/stat.h>
 #  include <unistd.h>
 #  define PATH_SEP      '/'
 #  define HOME_ENV      "HOME"
 #  define MKDIR(p)      mkdir((p), 0755)
+#  define RMDIR(p)      rmdir(p)
 #endif
 
 /* ===== 定数 ===== */
-#define INDEX_URL   "https://raw.githubusercontent.com/Neosku/aviutl2-catalog-data/main/index.json"
-#define CACHE_FILE  "au2cat_cache.json"   /* ホームディレクトリ内 */
-#define CACHE_TTL   1800                  /* 30分 (秒) */
-#define MAX_PKG     512
-#define MAX_STR     512
-#define MAX_TAGS    16
-#define MAX_DEPS    32
+#define INDEX_URL    "https://raw.githubusercontent.com/Neosku/aviutl2-catalog-data/main/index.json"
+#define CACHE_FILE   "au2cat_cache.json"   /* ホームディレクトリ内 */
+#define CACHE_TTL    1800                  /* 30分 (秒) */
+#define CONFIG_FILE  "au2cat_config.json"  /* ホームディレクトリ内 */
+#define TMP_DIRNAME  "au2cat_tmp"          /* ホームディレクトリ内 */
+#define MAX_PKG      512
+#define MAX_STR      512
+#define MAX_TAGS     16
+#define MAX_DEPS     32
+
+/* インストーラー関連 */
+#define ACT_STR      256
+#define MAX_ACTIONS  8
+#define MAX_ARGS     6
 
 /* ===== カラー ===== */
 #ifdef _WIN32
@@ -74,6 +106,34 @@ static void color_init(void) {}
 #  define C(c)      printf("\033[%dm", (c))
 #endif
 
+/* ===== インストーラー構造体 ===== */
+typedef enum {
+    ACT_DOWNLOAD, ACT_EXTRACT, ACT_EXTRACT_SFX, ACT_COPY,
+    ACT_RUN, ACT_RUN_AUO_SETUP, ACT_DELETE, ACT_UNKNOWN
+} ActionType;
+
+typedef struct {
+    ActionType type;
+    char path[ACT_STR];
+    char from[ACT_STR];
+    char to[ACT_STR];
+    char args[MAX_ARGS][ACT_STR];
+    int  arg_count;
+    int  elevate;
+} InstallAction;
+
+typedef struct {
+    int  is_github;
+    char direct_url[ACT_STR];
+    char gh_owner[128];
+    char gh_repo[128];
+    char gh_pattern[256];
+    InstallAction install_actions[MAX_ACTIONS];
+    int  install_count;
+    InstallAction uninstall_actions[MAX_ACTIONS];
+    int  uninstall_count;
+} Installer;
+
 /* ===== パッケージ構造体 ===== */
 typedef struct {
     char id[MAX_STR];
@@ -90,6 +150,8 @@ typedef struct {
     char deps[MAX_DEPS][MAX_STR];
     int  dep_count;
     int  deprecated;
+    Installer installer;
+    int  has_installer;
 } Package;
 
 static Package g_pkg[MAX_PKG];
@@ -167,6 +229,135 @@ static const char *skip_val(const char *p) {
     return p;
 }
 
+/* ---- インストーラー JSON パース ---- */
+static const char *parse_action(const char *p, InstallAction *act) {
+    memset(act,0,sizeof(*act));
+    char key[64], val[ACT_STR];
+    p=skip_ws(p);
+    if(*p!='{') return skip_val(p);
+    p++; p=skip_ws(p);
+    while(*p && *p!='}'){
+        p=skip_ws(p); if(*p!='"') break;
+        p=parse_str(p,key,sizeof(key)); if(!p) return NULL;
+        p=skip_ws(p); if(*p==':')p++; p=skip_ws(p);
+
+        if(!strcmp(key,"action")){
+            p=parse_str(p,val,sizeof(val));
+            if(!strcmp(val,"download")) act->type=ACT_DOWNLOAD;
+            else if(!strcmp(val,"extract")) act->type=ACT_EXTRACT;
+            else if(!strcmp(val,"extract_sfx")) act->type=ACT_EXTRACT_SFX;
+            else if(!strcmp(val,"copy")) act->type=ACT_COPY;
+            else if(!strcmp(val,"run")) act->type=ACT_RUN;
+            else if(!strcmp(val,"run_auo_setup")) act->type=ACT_RUN_AUO_SETUP;
+            else if(!strcmp(val,"delete")) act->type=ACT_DELETE;
+            else act->type=ACT_UNKNOWN;
+        }
+        else if(!strcmp(key,"path")) p=parse_str(p,act->path,sizeof(act->path));
+        else if(!strcmp(key,"from")) p=parse_str(p,act->from,sizeof(act->from));
+        else if(!strcmp(key,"to"))   p=parse_str(p,act->to,sizeof(act->to));
+        else if(!strcmp(key,"elevate")){
+            if(!strncmp(p,"true",4)){ act->elevate=1; p+=4; }
+            else if(!strncmp(p,"false",5)){ act->elevate=0; p+=5; }
+            else p=skip_val(p);
+        }
+        else if(!strcmp(key,"args")){
+            if(*p=='['){
+                p++; p=skip_ws(p);
+                while(*p && *p!=']'){
+                    if(*p=='"' && act->arg_count<MAX_ARGS) p=parse_str(p,act->args[act->arg_count++],ACT_STR);
+                    else p=skip_val(p);
+                    if(!p) return NULL;
+                    p=skip_ws(p); if(*p==',')p++; p=skip_ws(p);
+                }
+                if(*p==']')p++;
+            } else p=skip_val(p);
+        }
+        else p=skip_val(p);
+
+        if(!p) return NULL;
+        p=skip_ws(p); if(*p==',')p++; p=skip_ws(p);
+    }
+    if(*p=='}')p++;
+    return p;
+}
+
+static const char *parse_action_array(const char *p, InstallAction *arr, int *count, int maxn) {
+    *count=0;
+    p=skip_ws(p);
+    if(*p!='['){ return skip_val(p); }
+    p++; p=skip_ws(p);
+    while(*p && *p!=']'){
+        if(*p=='{'){
+            if(*count<maxn) p=parse_action(p,&arr[(*count)++]);
+            else p=skip_val(p);
+        } else p=skip_val(p);
+        if(!p) return NULL;
+        p=skip_ws(p); if(*p==',')p++; p=skip_ws(p);
+    }
+    if(*p==']')p++;
+    return p;
+}
+
+static const char *parse_installer(const char *p, Installer *ins) {
+    memset(ins,0,sizeof(*ins));
+    char key[64];
+    p=skip_ws(p);
+    if(*p!='{') return skip_val(p);
+    p++; p=skip_ws(p);
+    while(*p && *p!='}'){
+        p=skip_ws(p); if(*p!='"') break;
+        p=parse_str(p,key,sizeof(key)); if(!p) return NULL;
+        p=skip_ws(p); if(*p==':')p++; p=skip_ws(p);
+
+        if(!strcmp(key,"source")){
+            p=skip_ws(p);
+            if(*p=='{'){
+                p++; p=skip_ws(p);
+                while(*p && *p!='}'){
+                    char skey[64];
+                    p=skip_ws(p); if(*p!='"') break;
+                    p=parse_str(p,skey,sizeof(skey)); if(!p) return NULL;
+                    p=skip_ws(p); if(*p==':')p++; p=skip_ws(p);
+                    if(!strcmp(skey,"direct")){
+                        p=parse_str(p,ins->direct_url,sizeof(ins->direct_url));
+                        ins->is_github=0;
+                    } else if(!strcmp(skey,"github")){
+                        ins->is_github=1;
+                        p=skip_ws(p);
+                        if(*p=='{'){
+                            p++; p=skip_ws(p);
+                            while(*p && *p!='}'){
+                                char gkey[64];
+                                p=skip_ws(p); if(*p!='"') break;
+                                p=parse_str(p,gkey,sizeof(gkey)); if(!p) return NULL;
+                                p=skip_ws(p); if(*p==':')p++; p=skip_ws(p);
+                                if(!strcmp(gkey,"owner")) p=parse_str(p,ins->gh_owner,sizeof(ins->gh_owner));
+                                else if(!strcmp(gkey,"repo")) p=parse_str(p,ins->gh_repo,sizeof(ins->gh_repo));
+                                else if(!strcmp(gkey,"pattern")) p=parse_str(p,ins->gh_pattern,sizeof(ins->gh_pattern));
+                                else p=skip_val(p);
+                                if(!p) return NULL;
+                                p=skip_ws(p); if(*p==',')p++; p=skip_ws(p);
+                            }
+                            if(*p=='}')p++;
+                        }
+                    } else p=skip_val(p);
+                    if(!p) return NULL;
+                    p=skip_ws(p); if(*p==',')p++; p=skip_ws(p);
+                }
+                if(*p=='}')p++;
+            } else p=skip_val(p);
+        }
+        else if(!strcmp(key,"install"))   p=parse_action_array(p, ins->install_actions,   &ins->install_count,   MAX_ACTIONS);
+        else if(!strcmp(key,"uninstall")) p=parse_action_array(p, ins->uninstall_actions, &ins->uninstall_count, MAX_ACTIONS);
+        else p=skip_val(p);
+
+        if(!p) return NULL;
+        p=skip_ws(p); if(*p==',')p++; p=skip_ws(p);
+    }
+    if(*p=='}')p++;
+    return p;
+}
+
 static const char *parse_pkg(const char *p, Package *pk) {
     char key[MAX_STR];
     memset(pk,0,sizeof(*pk));
@@ -220,6 +411,7 @@ static const char *parse_pkg(const char *p, Package *pk) {
                 if(*p==']')p++;
             } else p=skip_val(p);
         }
+        else if(!strcmp(key,"installer")) { p=parse_installer(p,&pk->installer); pk->has_installer=1; }
         else { p=skip_val(p); }
 
         if(!p)return NULL;
@@ -273,18 +465,141 @@ static char *http_get(const char *url) {
     return b.data;
 }
 
+static size_t write_file_cb(void *ptr, size_t sz, size_t n, void *ud) {
+    FILE *f=(FILE*)ud;
+    return fwrite(ptr,sz,n,f);
+}
+
+/* ===== 汎用ファイルシステムユーティリティ ===== */
+static void mkdir_p(const char *path) {
+    char tmp[1024];
+    snprintf(tmp,sizeof(tmp),"%s",path);
+    size_t len=strlen(tmp);
+    if(len && (tmp[len-1]=='/'||tmp[len-1]=='\\')) tmp[len-1]='\0';
+    char *p;
+    for(p=tmp+1; *p; p++){
+        if(*p=='/'||*p=='\\'){
+            char c=*p; *p='\0';
+            MKDIR(tmp);
+            *p=c;
+        }
+    }
+    MKDIR(tmp);
+}
+
+static int download_to_file(const char *url, const char *outpath) {
+    char dirbuf[1024]; snprintf(dirbuf,sizeof(dirbuf),"%s",outpath);
+    char *slash=strrchr(dirbuf,'/');
+    if(!slash) slash=strrchr(dirbuf,'\\');
+    if(slash){ *slash='\0'; mkdir_p(dirbuf); }
+
+    FILE *f=fopen(outpath,"wb");
+    if(!f) return 0;
+    CURL *c=curl_easy_init();
+    if(!c){ fclose(f); return 0; }
+    curl_easy_setopt(c,CURLOPT_URL,url);
+    curl_easy_setopt(c,CURLOPT_WRITEFUNCTION,write_file_cb);
+    curl_easy_setopt(c,CURLOPT_WRITEDATA,f);
+    curl_easy_setopt(c,CURLOPT_FOLLOWLOCATION,1L);
+    curl_easy_setopt(c,CURLOPT_USERAGENT,"au2cat/1.0");
+    curl_easy_setopt(c,CURLOPT_SSL_VERIFYPEER,1L);
+    CURLcode r=curl_easy_perform(c);
+    curl_easy_cleanup(c);
+    fclose(f);
+    if(r!=CURLE_OK){ fprintf(stderr,"au2cat: ダウンロードエラー: %s\n",curl_easy_strerror(r)); return 0; }
+    return 1;
+}
+
+static int copy_file_single(const char *src, const char *dst) {
+    FILE *in=fopen(src,"rb"); if(!in) return 0;
+    char dstdir[1024]; snprintf(dstdir,sizeof(dstdir),"%s",dst);
+    char *slash=strrchr(dstdir,'/');
+    if(!slash) slash=strrchr(dstdir,'\\');
+    if(slash){ *slash='\0'; mkdir_p(dstdir); }
+    FILE *out=fopen(dst,"wb");
+    if(!out){ fclose(in); return 0; }
+    char buf[8192]; size_t n;
+    while((n=fread(buf,1,sizeof(buf),in))>0) fwrite(buf,1,n,out);
+    fclose(in); fclose(out);
+    return 1;
+}
+
+static int copy_dir_recursive(const char *src, const char *dst) {
+    mkdir_p(dst);
+    DIR *d=opendir(src);
+    if(!d) return 0;
+    struct dirent *ent;
+    int ok=1;
+    while((ent=readdir(d))){
+        if(!strcmp(ent->d_name,".")||!strcmp(ent->d_name,"..")) continue;
+        char s[1024], t[1024];
+        snprintf(s,sizeof(s),"%s/%s",src,ent->d_name);
+        snprintf(t,sizeof(t),"%s/%s",dst,ent->d_name);
+        struct stat st;
+        if(stat(s,&st)==0 && S_ISDIR(st.st_mode)) { if(!copy_dir_recursive(s,t)) ok=0; }
+        else { if(!copy_file_single(s,t)) ok=0; }
+    }
+    closedir(d);
+    return ok;
+}
+
+static int remove_dir_recursive(const char *path) {
+    DIR *d=opendir(path);
+    if(!d) return 0;
+    struct dirent *ent;
+    while((ent=readdir(d))){
+        if(!strcmp(ent->d_name,".")||!strcmp(ent->d_name,"..")) continue;
+        char sub[1024]; snprintf(sub,sizeof(sub),"%s/%s",path,ent->d_name);
+        struct stat st;
+        if(stat(sub,&st)==0 && S_ISDIR(st.st_mode)) remove_dir_recursive(sub);
+        else remove(sub);
+    }
+    closedir(d);
+    RMDIR(path);
+    return 1;
+}
+
+static int extract_zip(const char *zip_path, const char *dest_dir) {
+    int err=0;
+    zip_t *za = zip_open(zip_path, ZIP_RDONLY, &err);
+    if(!za){ fprintf(stderr,"au2cat: zipを開けません: %s\n", zip_path); return 0; }
+    zip_int64_t n = zip_get_num_entries(za,0);
+    zip_int64_t i;
+    for(i=0;i<n;i++){
+        const char *name = zip_get_name(za,(zip_uint64_t)i,0);
+        if(!name) continue;
+        char outpath[1024];
+        snprintf(outpath,sizeof(outpath),"%s/%s",dest_dir,name);
+        size_t l=strlen(name);
+        if(l>0 && name[l-1]=='/'){ mkdir_p(outpath); continue; }
+        char dirbuf[1024]; snprintf(dirbuf,sizeof(dirbuf),"%s",outpath);
+        char *slash=strrchr(dirbuf,'/');
+        if(slash){ *slash='\0'; mkdir_p(dirbuf); }
+        zip_file_t *zf = zip_fopen_index(za,(zip_uint64_t)i,0);
+        if(!zf) continue;
+        FILE *out=fopen(outpath,"wb");
+        if(out){
+            char buf[8192]; zip_int64_t rd;
+            while((rd=zip_fread(zf,buf,sizeof(buf)))>0) fwrite(buf,1,(size_t)rd,out);
+            fclose(out);
+        }
+        zip_fclose(zf);
+    }
+    zip_close(za);
+    return 1;
+}
+
 /* キャッシュパス: ~/au2cat_cache.json */
-static void cache_path(char *buf, int sz) {
+static void home_path(char *buf, int sz, const char *fname) {
     const char *home=getenv(HOME_ENV);
-    if(home) snprintf(buf,sz,"%s%c%s",home,PATH_SEP,CACHE_FILE);
-    else      snprintf(buf,sz,"%s",CACHE_FILE);
+    if(home) snprintf(buf,sz,"%s%c%s",home,PATH_SEP,fname);
+    else      snprintf(buf,sz,"%s",fname);
 }
 
 static char *load_cache(void) {
-    char path[1024]; cache_path(path,sizeof(path));
+    char path[1024]; home_path(path,sizeof(path),CACHE_FILE);
     FILE *f=fopen(path,"rb"); if(!f)return NULL;
 
-    /* TTLチェック: ファイルの mtime */
 #ifndef _WIN32
     struct stat st;
     if(stat(path,&st)==0){
@@ -298,7 +613,6 @@ static char *load_cache(void) {
         GetFileTime(h,NULL,NULL,&wt);
         CloseHandle(h);
         ui.LowPart=wt.dwLowDateTime; ui.HighPart=wt.dwHighDateTime;
-        /* FILETIME: 100ns intervals since 1601; convert to Unix epoch */
         time_t mtime=(time_t)((ui.QuadPart-116444736000000000ULL)/10000000ULL);
         if(time(NULL)-mtime>CACHE_TTL){ fclose(f); return NULL; }
     }
@@ -311,7 +625,7 @@ static char *load_cache(void) {
 }
 
 static void save_cache(const char *json) {
-    char path[1024]; cache_path(path,sizeof(path));
+    char path[1024]; home_path(path,sizeof(path),CACHE_FILE);
     FILE *f=fopen(path,"wb"); if(!f)return;
     fwrite(json,1,strlen(json),f); fclose(f);
 }
@@ -348,7 +662,6 @@ static int load_catalog(int force_update) {
 }
 
 /* ===== 文字列ユーティリティ ===== */
-/* ASCII 大文字小文字を無視した完全一致 (strcasecmp の代替・C99 標準のみ使用) */
 static int str_iequal(const char *a, const char *b) {
     while (*a && *b) {
         char ca = *a, cb = *b;
@@ -361,7 +674,6 @@ static int str_iequal(const char *a, const char *b) {
 }
 
 static int str_icontains(const char *haystack, const char *needle) {
-    /* ASCII 大文字小文字を無視して部分一致 (日本語はバイト一致) */
     size_t nl=strlen(needle);
     if(!nl) return 1;
     size_t hl=strlen(haystack);
@@ -379,9 +691,7 @@ static int str_icontains(const char *haystack, const char *needle) {
     return 0;
 }
 
-/* UTF-8 バイト列を max_bytes 以内で切り詰め、残りを空白で埋めて幅を揃える */
 static void print_cell(const char *s, int col_bytes) {
-    /* 表示幅カウント: ASCII=1, 多バイト=2 (CJK概算) */
     int byte_pos=0, display_width=0, limit=col_bytes;
     while(s[byte_pos]){
         unsigned char c=(unsigned char)s[byte_pos];
@@ -393,7 +703,6 @@ static void print_cell(const char *s, int col_bytes) {
         int k; for(k=0;k<bytes;k++) putchar(s[byte_pos+k]);
         byte_pos+=bytes; display_width+=dw;
     }
-    /* 残りスペース埋め */
     while(display_width<limit){ putchar(' '); display_width++; }
 }
 
@@ -401,11 +710,438 @@ static void print_cell(const char *s, int col_bytes) {
 static int cmp_pop(const void*a,const void*b){ return (int)(g_pkg[*(int*)b].popularity-g_pkg[*(int*)a].popularity); }
 static int cmp_name(const void*a,const void*b){ return strcmp(g_pkg[*(int*)a].name,g_pkg[*(int*)b].name); }
 
+/* ===== パッケージ検索 (id完全一致 -> 名前完全一致 -> 部分一致) ===== */
+static Package *find_package(const char *query) {
+    int i;
+    for(i=0;i<g_count;i++) if(!strcmp(g_pkg[i].id,query)) return &g_pkg[i];
+    for(i=0;i<g_count;i++) if(str_iequal(g_pkg[i].name,query)) return &g_pkg[i];
+
+    Package *candidates[MAX_PKG]; int cn=0;
+    for(i=0;i<g_count;i++)
+        if(str_icontains(g_pkg[i].name,query)||str_icontains(g_pkg[i].id,query))
+            candidates[cn++]=&g_pkg[i];
+    if(cn==1) return candidates[0];
+    if(cn>1){
+        fprintf(stderr,"au2cat: \"%s\" は複数のパッケージに該当します:\n",query);
+        for(i=0;i<cn;i++) fprintf(stderr,"  %s (%s)\n",candidates[i]->name,candidates[i]->id);
+        fprintf(stderr,"ID を指定してください。\n");
+        return NULL;
+    }
+    return NULL;
+}
+
+/* ===== 簡易正規表現 (^ $ . \d \. * +  リテラル のみ対応) ===== */
+static int rx_get_atom(const char **pat, int *is_digit, int *is_any, char *lit) {
+    const char *p=*pat;
+    if(*p=='\\'){
+        p++;
+        if(*p=='d'){ *is_digit=1; *is_any=0; *lit=0; p++; }
+        else { *lit=*p; *is_digit=0; *is_any=0; p++; }
+    } else if(*p=='.'){ *is_any=1; *is_digit=0; *lit=0; p++; }
+    else { *lit=*p; *is_digit=0; *is_any=0; p++; }
+    *pat=p;
+    return 1;
+}
+
+static int rx_atom_matches(int is_digit,int is_any,char lit,char c){
+    if(is_digit) return isdigit((unsigned char)c)!=0;
+    if(is_any) return c!='\0';
+    return c==lit;
+}
+
+static int rx_match_here(const char *pat, const char *s) {
+    if(*pat=='\0') return *s=='\0';
+    if(*pat=='$' && *(pat+1)=='\0') return *s=='\0';
+
+    const char *p=pat;
+    int is_digit=0,is_any=0; char lit=0;
+    rx_get_atom(&p,&is_digit,&is_any,&lit);
+
+    char quant = *p;
+    if(quant=='*'||quant=='+'){
+        const char *rest=p+1;
+        int min_count = (quant=='+')?1:0;
+        int count=0;
+        const char *t=s;
+        while(rx_atom_matches(is_digit,is_any,lit,*t)){ t++; count++; }
+        int k;
+        for(k=count;k>=min_count;k--){
+            if(rx_match_here(rest, s+k)) return 1;
+        }
+        return 0;
+    } else {
+        if(!rx_atom_matches(is_digit,is_any,lit,*s)) return 0;
+        return rx_match_here(p, s+1);
+    }
+}
+
+static int rx_match(const char *pattern, const char *str) {
+    const char *p = pattern;
+    if(*p=='^') p++;
+    return rx_match_here(p, str);
+}
+
+/* ===== GitHub Releases ===== */
+typedef struct { char name[ACT_STR]; char url[700]; } GhAsset;
+
+static int gh_parse_assets(const char *json, GhAsset *out, int max_assets) {
+    const char *p = strstr(json, "\"assets\"");
+    if(!p) return 0;
+    p = strchr(p, '[');
+    if(!p) return 0;
+    p++; p=skip_ws(p);
+    int n=0;
+    while(*p && *p!=']' && n<max_assets) {
+        if(*p=='{'){
+            p++;
+            char key[64];
+            GhAsset a; memset(&a,0,sizeof(a));
+            p=skip_ws(p);
+            while(*p && *p!='}'){
+                p=skip_ws(p);
+                if(*p!='"') break;
+                p=parse_str(p,key,sizeof(key));
+                p=skip_ws(p); if(*p==':')p++; p=skip_ws(p);
+                if(!strcmp(key,"name")) p=parse_str(p,a.name,sizeof(a.name));
+                else if(!strcmp(key,"browser_download_url")) p=parse_str(p,a.url,sizeof(a.url));
+                else p=skip_val(p);
+                if(!p) return n;
+                p=skip_ws(p); if(*p==',')p++; p=skip_ws(p);
+            }
+            if(*p=='}') p++;
+            out[n++]=a;
+        }
+        p=skip_ws(p); if(*p==',')p++; p=skip_ws(p);
+    }
+    return n;
+}
+
+static int resolve_source(Package *pkg, char *url_out, size_t url_sz, char *name_out, size_t name_sz) {
+    Installer *ins=&pkg->installer;
+    if(!ins->is_github){
+        if(!ins->direct_url[0]){ fprintf(stderr,"au2cat: ダウンロード元が設定されていません\n"); return 0; }
+        snprintf(url_out,url_sz,"%s",ins->direct_url);
+        const char *base=strrchr(ins->direct_url,'/');
+        snprintf(name_out,name_sz,"%s", base?base+1:ins->direct_url);
+        return 1;
+    }
+    char api[512];
+    snprintf(api,sizeof(api),"https://api.github.com/repos/%s/%s/releases/latest", ins->gh_owner, ins->gh_repo);
+    char *json = http_get(api);
+    if(!json){ fprintf(stderr,"au2cat: GitHub APIへのアクセスに失敗しました\n"); return 0; }
+    GhAsset assets[64];
+    int n=gh_parse_assets(json,assets,64);
+    int found=0,i;
+    for(i=0;i<n;i++){
+        if(rx_match(ins->gh_pattern, assets[i].name)){
+            snprintf(url_out,url_sz,"%s",assets[i].url);
+            snprintf(name_out,name_sz,"%s",assets[i].name);
+            found=1; break;
+        }
+    }
+    free(json);
+    if(!found) fprintf(stderr,"au2cat: パターンに一致するリリースアセットが見つかりません: %s\n", ins->gh_pattern);
+    return found;
+}
+
+/* ===== 設定 (appDir / pluginsDir) ===== */
+typedef struct { char app_dir[1024]; char plugins_dir[1024]; } Config;
+
+static void config_path(char *buf,int sz){ home_path(buf,sz,CONFIG_FILE); }
+
+static int load_config(Config *cfg) {
+    memset(cfg,0,sizeof(*cfg));
+    char path[1024]; config_path(path,sizeof(path));
+    FILE *f=fopen(path,"rb");
+    if(!f) return 0;
+    fseek(f,0,SEEK_END); long len=ftell(f); fseek(f,0,SEEK_SET);
+    char *buf=malloc(len+1); if(!buf){fclose(f);return 0;}
+    size_t rd=fread(buf,1,len,f); buf[rd]='\0'; fclose(f);
+
+    const char *p=skip_ws(buf);
+    if(*p=='{'){
+        p++;
+        char key[64];
+        p=skip_ws(p);
+        while(*p && *p!='}'){
+            p=skip_ws(p); if(*p!='"') break;
+            p=parse_str(p,key,sizeof(key)); if(!p) break;
+            p=skip_ws(p); if(*p==':')p++; p=skip_ws(p);
+            if(!strcmp(key,"appDir")) p=parse_str(p,cfg->app_dir,sizeof(cfg->app_dir));
+            else if(!strcmp(key,"pluginsDir")) p=parse_str(p,cfg->plugins_dir,sizeof(cfg->plugins_dir));
+            else p=skip_val(p);
+            if(!p) break;
+            p=skip_ws(p); if(*p==',')p++; p=skip_ws(p);
+        }
+    }
+    free(buf);
+    return cfg->app_dir[0]!=0;
+}
+
+static void json_escape(const char *in, char *out, size_t outsz) {
+    size_t oi=0;
+    const char *p;
+    for(p=in; *p && oi+2<outsz; p++){
+        if(*p=='\\' || *p=='"') out[oi++]='\\';
+        out[oi++]=*p;
+    }
+    out[oi]='\0';
+}
+
+static void save_config(Config *cfg) {
+    char path[1024]; config_path(path,sizeof(path));
+    char esc_app[2048], esc_plug[2048];
+    json_escape(cfg->app_dir,esc_app,sizeof(esc_app));
+    json_escape(cfg->plugins_dir,esc_plug,sizeof(esc_plug));
+    FILE *f=fopen(path,"wb");
+    if(!f) return;
+    fprintf(f,"{\n  \"appDir\": \"%s\",\n  \"pluginsDir\": \"%s\"\n}\n", esc_app, esc_plug);
+    fclose(f);
+}
+
+static void prompt_config(Config *cfg) {
+    char line[1024]; size_t l;
+
+    C(33); printf(":: "); C_RESET;
+    printf("AviUtl2 のインストール先が設定されていません。初回設定を行います。\n");
+    printf("AviUtl2 のインストールフォルダのパスを入力してください: ");
+    fflush(stdout);
+    if(fgets(line,sizeof(line),stdin)){
+        l=strlen(line); while(l>0 && (line[l-1]=='\n'||line[l-1]=='\r')) line[--l]='\0';
+        snprintf(cfg->app_dir,sizeof(cfg->app_dir),"%s",line);
+    }
+
+    char default_plugins[1024];
+    snprintf(default_plugins,sizeof(default_plugins),"%s/Plugin",cfg->app_dir);
+    printf("プラグインフォルダのパス [既定: %s]: ", default_plugins);
+    fflush(stdout);
+    if(fgets(line,sizeof(line),stdin)){
+        l=strlen(line); while(l>0 && (line[l-1]=='\n'||line[l-1]=='\r')) line[--l]='\0';
+        if(l>0) snprintf(cfg->plugins_dir,sizeof(cfg->plugins_dir),"%s",line);
+        else    snprintf(cfg->plugins_dir,sizeof(cfg->plugins_dir),"%s",default_plugins);
+    } else {
+        snprintf(cfg->plugins_dir,sizeof(cfg->plugins_dir),"%s",default_plugins);
+    }
+
+    save_config(cfg);
+    C(32); printf(":: "); C_RESET; printf("設定を保存しました: ");
+    char path[1024]; config_path(path,sizeof(path)); printf("%s\n",path);
+}
+
+static void ensure_config(Config *cfg) {
+    if(!load_config(cfg)){
+        prompt_config(cfg);
+    } else if(!cfg->plugins_dir[0]){
+        snprintf(cfg->plugins_dir,sizeof(cfg->plugins_dir),"%s/Plugin",cfg->app_dir);
+    }
+}
+
+/* ===== Windows / Wine による exe 実行 ===== */
+#ifndef _WIN32
+static int wine_available(void) {
+    static int checked=0, avail=0;
+    if(!checked){
+        checked=1;
+        avail = (system("wine --version > /dev/null 2>&1") == 0);
+    }
+    return avail;
+}
+#endif
+
+static int can_run_exe(void) {
+#ifdef _WIN32
+    return 1;
+#else
+    return wine_available();
+#endif
+}
+
+static int run_exe(const char *path, char args[][ACT_STR], int argc_, int elevate) {
+#ifdef _WIN32
+    char argline[2048]=""; int i;
+    for(i=0;i<argc_;i++){
+        strncat(argline,args[i],sizeof(argline)-strlen(argline)-2);
+        strncat(argline," ",sizeof(argline)-strlen(argline)-1);
+    }
+    if(elevate){
+        SHELLEXECUTEINFOA sei; memset(&sei,0,sizeof(sei));
+        sei.cbSize=sizeof(sei);
+        sei.lpVerb="runas";
+        sei.lpFile=path;
+        sei.lpParameters=argline;
+        sei.nShow=SW_SHOWNORMAL;
+        sei.fMask=SEE_MASK_NOCLOSEPROCESS;
+        if(!ShellExecuteExA(&sei)) return 0;
+        if(sei.hProcess){ WaitForSingleObject(sei.hProcess, INFINITE); CloseHandle(sei.hProcess); }
+        return 1;
+    } else {
+        char cmd[2560];
+        snprintf(cmd,sizeof(cmd),"\"%s\" %s", path, argline);
+        return system(cmd)==0;
+    }
+#else
+    if(!wine_available()){
+        fprintf(stderr,"au2cat: このアクションには Windows または Wine が必要です。スキップします: %s\n", path);
+        return 0;
+    }
+    char cmd[2560]; int i;
+    snprintf(cmd,sizeof(cmd),"wine \"%s\"",path);
+    for(i=0;i<argc_;i++){
+        strncat(cmd," ",sizeof(cmd)-strlen(cmd)-1);
+        strncat(cmd,args[i],sizeof(cmd)-strlen(cmd)-1);
+    }
+    if(elevate){
+        C(33); printf(":: "); C_RESET;
+        printf("Wine環境では管理者権限の昇格はサポートされません。通常権限で実行します。\n");
+    }
+    return system(cmd)==0;
+#endif
+}
+
+static int do_extract_sfx(const char *exe_path, const char *dest_dir) {
+    if(!can_run_exe()){
+        fprintf(stderr,"au2cat: extract_sfx には Windows または Wine が必要です。スキップします: %s\n", exe_path);
+        return 0;
+    }
+    char arg[ACT_STR];
+    snprintf(arg,sizeof(arg),"-o\"%s\" -y", dest_dir);
+    char args[1][ACT_STR];
+    snprintf(args[0],ACT_STR,"%s",arg);
+    C(33); printf(":: "); C_RESET;
+    printf("自己解凍書庫を展開しています (7-Zip SFX 想定。Windows/Wine使用)...\n");
+    return run_exe(exe_path,args,1,0);
+}
+
+/* ===== パス置換 ({tmp} {appDir} {pluginsDir} {download}) ===== */
+typedef struct {
+    char pkg_tmp_dir[1024];
+    char download_path[1024];
+    int  have_download;
+} InstallCtx;
+
+static void append_str(char *out, size_t outsz, size_t *oi, const char *s){
+    size_t l=strlen(s);
+    if(*oi+l>=outsz) l = (*oi<outsz)? outsz-1-*oi : 0;
+    if(l>0){ memcpy(out+*oi,s,l); *oi+=l; }
+}
+
+static void resolve_path(const char *tmpl, InstallCtx *ctx, Config *cfg, char *out, size_t outsz) {
+    size_t oi=0; out[0]='\0';
+    const char *p=tmpl;
+    while(*p){
+        if(!strncmp(p,"{tmp}",5)){ append_str(out,outsz,&oi,ctx->pkg_tmp_dir); p+=5; }
+        else if(!strncmp(p,"{appDir}",8)){ append_str(out,outsz,&oi,cfg->app_dir); p+=8; }
+        else if(!strncmp(p,"{pluginsDir}",12)){ append_str(out,outsz,&oi,cfg->plugins_dir); p+=12; }
+        else if(!strncmp(p,"{download}",10)){ append_str(out,outsz,&oi,ctx->download_path); p+=10; }
+        else { char c[2]; c[0]=*p; c[1]='\0'; append_str(out,outsz,&oi,c); p++; }
+    }
+    if(oi<outsz) out[oi]='\0'; else out[outsz-1]='\0';
+}
+
+/* ===== アクション実行 ===== */
+static int exec_action(InstallAction *act, InstallCtx *ctx, Config *cfg, Package *pkg) {
+    char rp[1024], rf[1024], rt[1024];
+
+    switch(act->type){
+    case ACT_DOWNLOAD: {
+        char url[1024], fname[ACT_STR], outpath[1024];
+        if(!resolve_source(pkg, url, sizeof(url), fname, sizeof(fname))) return 0;
+        snprintf(outpath,sizeof(outpath),"%s/%s",ctx->pkg_tmp_dir,fname);
+        C(33); printf(":: "); C_RESET; printf("ダウンロード中: %s\n", url);
+        if(!download_to_file(url,outpath)) { fprintf(stderr,"au2cat: ダウンロードに失敗しました\n"); return 0; }
+        snprintf(ctx->download_path,sizeof(ctx->download_path),"%s",outpath);
+        ctx->have_download=1;
+        C(32); printf(":: "); C_RESET; printf("ダウンロード完了: %s\n", outpath);
+        return 1;
+    }
+    case ACT_EXTRACT:
+        if(!ctx->have_download){ fprintf(stderr,"au2cat: extract: ダウンロード済みファイルがありません\n"); return 0; }
+        C(33); printf(":: "); C_RESET; printf("展開中: %s\n", ctx->download_path);
+        return extract_zip(ctx->download_path, ctx->pkg_tmp_dir);
+
+    case ACT_EXTRACT_SFX:
+        if(!ctx->have_download){ fprintf(stderr,"au2cat: extract_sfx: ダウンロード済みファイルがありません\n"); return 0; }
+        return do_extract_sfx(ctx->download_path, ctx->pkg_tmp_dir);
+
+    case ACT_COPY: {
+        resolve_path(act->from, ctx, cfg, rf, sizeof(rf));
+        resolve_path(act->to,   ctx, cfg, rt, sizeof(rt));
+        struct stat st;
+        if(stat(rf,&st)!=0){ fprintf(stderr,"au2cat: コピー元が見つかりません: %s\n", rf); return 0; }
+        C(33); printf(":: "); C_RESET; printf("コピー中: %s -> %s\n", rf, rt);
+        if(S_ISDIR(st.st_mode)) return copy_dir_recursive(rf,rt);
+        else {
+            char dst[1024];
+            struct stat tst;
+            int to_is_dir = (stat(rt,&tst)==0 && S_ISDIR(tst.st_mode));
+            size_t rtlen=strlen(rt);
+            int to_looks_dir = (rtlen>0 && (rt[rtlen-1]=='/'||rt[rtlen-1]=='\\'));
+            if(to_is_dir || to_looks_dir){
+                const char *base=strrchr(rf,'/');
+                if(!base) base=strrchr(rf,'\\');
+                base = base?base+1:rf;
+                snprintf(dst,sizeof(dst),"%s/%s",rt,base);
+            } else {
+                snprintf(dst,sizeof(dst),"%s",rt);
+            }
+            return copy_file_single(rf,dst);
+        }
+    }
+
+    case ACT_RUN:
+    case ACT_RUN_AUO_SETUP: {
+        resolve_path(act->path, ctx, cfg, rp, sizeof(rp));
+        if(!can_run_exe()){
+            fprintf(stderr,"au2cat: このアクションには Windows または Wine が必要です。スキップします: %s\n", rp);
+            return 0;
+        }
+        char resolved_args[MAX_ARGS][ACT_STR];
+        int i;
+        for(i=0;i<act->arg_count;i++) resolve_path(act->args[i], ctx, cfg, resolved_args[i], ACT_STR);
+        C(33); printf(":: "); C_RESET; printf("実行中: %s\n", rp);
+        if(act->elevate){ C(33); printf(":: "); C_RESET; printf("(管理者権限が必要です)\n"); }
+        return run_exe(rp, resolved_args, act->arg_count, act->elevate);
+    }
+
+    case ACT_DELETE: {
+        resolve_path(act->path, ctx, cfg, rp, sizeof(rp));
+        struct stat st;
+        if(stat(rp,&st)!=0) return 1; /* 既に存在しない場合は成功扱い */
+        C(33); printf(":: "); C_RESET; printf("削除中: %s\n", rp);
+        if(S_ISDIR(st.st_mode)) return remove_dir_recursive(rp);
+        remove(rp);
+        return 1;
+    }
+
+    default:
+        return 1;
+    }
+}
+
+/* ===== 確認プロンプト ===== */
+static int confirm_yes(const char *prompt) {
+    char line[16];
+    printf("%s [Y/n]: ", prompt);
+    fflush(stdout);
+    if(!fgets(line,sizeof(line),stdin)) return 1;
+    if(line[0]=='\0'||line[0]=='\n') return 1;
+    return (line[0]=='y'||line[0]=='Y');
+}
+
+static int extract_yes_flag(int *argc, char **argv) {
+    int yes=0, w=0, i;
+    for(i=0;i<*argc;i++){
+        if(!strcmp(argv[i],"-y")||!strcmp(argv[i],"--yes")) yes=1;
+        else argv[w++]=argv[i];
+    }
+    *argc=w;
+    return yes;
+}
+
 /* ===== サブコマンド実装 ===== */
 
 /* ---- search ---- */
 static void cmd_search(int argc, char **argv) {
-    /* 全引数をスペース結合してクエリに */
     char query[MAX_STR]="";
     int i;
     for(i=0;i<argc;i++){
@@ -440,7 +1176,6 @@ static void cmd_search(int argc, char **argv) {
         return;
     }
 
-    /* ヘッダ */
     C(1);
     printf("%-40s  %-14s  %-14s  %s\n","名前","作者","種類","バージョン");
     C_RESET;
@@ -506,7 +1241,6 @@ static void cmd_list(int argc, char **argv) {
 static void cmd_show(int argc, char **argv) {
     if(argc==0){ fprintf(stderr,"使い方: au2cat show <ID または 名前>\n"); return; }
 
-    /* 複数引数をスペース結合 */
     char query[MAX_STR]="";
     int i;
     for(i=0;i<argc;i++){
@@ -514,39 +1248,18 @@ static void cmd_show(int argc, char **argv) {
         strncat(query,argv[i],MAX_STR-strlen(query)-1);
     }
 
-    /* ID完全一致 → 名前完全一致 → 名前部分一致 */
-    Package *found=NULL;
-    for(i=0;i<g_count;i++) if(!strcmp(g_pkg[i].id,query)){found=&g_pkg[i];break;}
-    if(!found) for(i=0;i<g_count;i++) if(str_iequal(g_pkg[i].name,query)){found=&g_pkg[i];break;}
-    if(!found){
-        Package *candidates[MAX_PKG]; int cn=0;
-        for(i=0;i<g_count;i++)
-            if(str_icontains(g_pkg[i].name,query)||str_icontains(g_pkg[i].id,query))
-                candidates[cn++]=&g_pkg[i];
-        if(cn==1){ found=candidates[0]; }
-        else if(cn>1){
-            fprintf(stderr,"au2cat: \"%s\" は複数のパッケージに該当します:\n",query);
-            for(i=0;i<cn;i++) fprintf(stderr,"  %s (%s)\n",candidates[i]->name,candidates[i]->id);
-            fprintf(stderr,"ID を指定してください。\n");
-            return;
-        }
-    }
+    Package *p = find_package(query);
+    if(!p){ fprintf(stderr,"au2cat: パッケージ \"%s\" が見つかりません。\n",query); return; }
 
-    if(!found){ fprintf(stderr,"au2cat: パッケージ \"%s\" が見つかりません。\n",query); return; }
-
-    Package *p=found;
     printf("\n");
 
-    /* パッケージ名 */
     if(p->deprecated){ C(31); C(1); printf("%s",p->name); C_RESET; printf("  "); C(31); printf("[非推奨]"); C_RESET; }
     else              { C(32); C(1); printf("%s",p->name); C_RESET; }
     printf("\n");
 
-    /* 概要 */
     printf("%s\n",p->summary);
     printf("\n");
 
-    /* メタ情報 */
     C(1); printf("%-16s","ID"); C_RESET; printf(": %s\n",p->id);
     C(1); printf("%-16s","バージョン"); C_RESET; printf(": "); C(35); printf("%s",p->latest_version); C_RESET; printf("\n");
     C(1); printf("%-16s","種類"); C_RESET; printf(": %s\n",p->type);
@@ -570,12 +1283,121 @@ static void cmd_show(int argc, char **argv) {
         for(d=0;d<p->dep_count;d++){ printf(" %s",p->deps[d]); if(d<p->dep_count-1)printf(","); }
         printf("\n");
     }
+
+    C(1); printf("%-16s","インストール"); C_RESET; printf(": ");
+    if(p->has_installer && p->installer.install_count>0){
+        C(32); printf("au2cat install \"%s\" で利用可能", p->id); C_RESET; printf("\n");
+    } else {
+        printf("自動インストール情報なし (上記URLから手動で入手してください)\n");
+    }
     printf("\n");
+}
+
+/* ---- install ---- */
+static void cmd_install(int argc, char **argv, int assume_yes) {
+    if(argc==0){ fprintf(stderr,"使い方: au2cat install <ID または 名前> [-y]\n"); return; }
+
+    char query[MAX_STR]="";
+    int i;
+    for(i=0;i<argc;i++){
+        if(i) strncat(query," ",MAX_STR-strlen(query)-1);
+        strncat(query,argv[i],MAX_STR-strlen(query)-1);
+    }
+
+    Package *p = find_package(query);
+    if(!p){ fprintf(stderr,"au2cat: パッケージ \"%s\" が見つかりません。\n",query); return; }
+    if(!p->has_installer || p->installer.install_count==0){
+        fprintf(stderr,"au2cat: \"%s\" には自動インストール情報がありません。手動でインストールしてください: %s\n",p->name,p->repo_url);
+        return;
+    }
+
+    Config cfg; ensure_config(&cfg);
+
+    C(33); printf(":: "); C_RESET;
+    printf("以下のパッケージをインストールします: "); C(1); printf("%s",p->name); C_RESET;
+    printf(" ("); C(35); printf("%s",p->latest_version); C_RESET; printf(")\n");
+    if(p->deprecated){ C(31); printf(":: 警告: このパッケージは非推奨です\n"); C_RESET; }
+
+    if(!assume_yes && !confirm_yes("続行しますか?")) { printf("中止しました。\n"); return; }
+
+    InstallCtx ctx; memset(&ctx,0,sizeof(ctx));
+    char home[1024]; const char *h=getenv(HOME_ENV);
+    snprintf(home,sizeof(home),"%s",h?h:".");
+    snprintf(ctx.pkg_tmp_dir,sizeof(ctx.pkg_tmp_dir),"%s%c%s%c%s",home,PATH_SEP,TMP_DIRNAME,PATH_SEP,p->id);
+    mkdir_p(ctx.pkg_tmp_dir);
+
+    int ok=1;
+    for(i=0;i<p->installer.install_count && ok;i++){
+        ok = exec_action(&p->installer.install_actions[i], &ctx, &cfg, p);
+    }
+
+    if(ok){ C(32); printf(":: "); C_RESET; printf("インストール完了: %s (%s)\n",p->name,p->latest_version); }
+    else  { C(31); printf(":: "); C_RESET; printf("インストールに失敗しました: %s\n",p->name); }
+}
+
+/* ---- uninstall ---- */
+static void cmd_uninstall(int argc, char **argv, int assume_yes) {
+    if(argc==0){ fprintf(stderr,"使い方: au2cat uninstall <ID または 名前> [-y]\n"); return; }
+
+    char query[MAX_STR]="";
+    int i;
+    for(i=0;i<argc;i++){
+        if(i) strncat(query," ",MAX_STR-strlen(query)-1);
+        strncat(query,argv[i],MAX_STR-strlen(query)-1);
+    }
+
+    Package *p = find_package(query);
+    if(!p){ fprintf(stderr,"au2cat: パッケージ \"%s\" が見つかりません。\n",query); return; }
+    if(!p->has_installer || p->installer.uninstall_count==0){
+        fprintf(stderr,"au2cat: \"%s\" にはアンインストール情報がありません。\n",p->name);
+        return;
+    }
+
+    Config cfg; ensure_config(&cfg);
+
+    C(33); printf(":: "); C_RESET;
+    printf("以下のパッケージをアンインストールします: "); C(1); printf("%s",p->name); C_RESET; printf("\n");
+
+    if(!assume_yes && !confirm_yes("続行しますか?")) { printf("中止しました。\n"); return; }
+
+    InstallCtx ctx; memset(&ctx,0,sizeof(ctx));
+    int ok=1;
+    for(i=0;i<p->installer.uninstall_count && ok;i++){
+        ok = exec_action(&p->installer.uninstall_actions[i], &ctx, &cfg, p);
+    }
+
+    if(ok){ C(32); printf(":: "); C_RESET; printf("アンインストール完了: %s\n",p->name); }
+    else  { C(31); printf(":: "); C_RESET; printf("アンインストールに失敗しました: %s\n",p->name); }
+}
+
+/* ---- config ---- */
+static void cmd_config(int argc, char **argv) {
+    Config cfg; load_config(&cfg);
+
+    if(argc==0){
+        C(1); printf("現在の設定:\n"); C_RESET;
+        printf("  appDir      : %s\n", cfg.app_dir[0]?cfg.app_dir:"(未設定)");
+        printf("  pluginsDir  : %s\n", cfg.plugins_dir[0]?cfg.plugins_dir:"(未設定)");
+        char path[1024]; config_path(path,sizeof(path));
+        printf("  設定ファイル: %s\n", path);
+        printf("\n変更するには:\n  au2cat config --app-dir <パス> [--plugins-dir <パス>]\n");
+        return;
+    }
+
+    int i;
+    for(i=0;i<argc;i++){
+        if(!strcmp(argv[i],"--app-dir") && i+1<argc){ snprintf(cfg.app_dir,sizeof(cfg.app_dir),"%s",argv[++i]); }
+        else if(!strcmp(argv[i],"--plugins-dir") && i+1<argc){ snprintf(cfg.plugins_dir,sizeof(cfg.plugins_dir),"%s",argv[++i]); }
+        else { fprintf(stderr,"au2cat: 不明なオプション '%s'\n",argv[i]); }
+    }
+    if(!cfg.plugins_dir[0] && cfg.app_dir[0]) snprintf(cfg.plugins_dir,sizeof(cfg.plugins_dir),"%s/Plugin",cfg.app_dir);
+
+    save_config(&cfg);
+    C(32); printf(":: "); C_RESET; printf("設定を保存しました。\n");
 }
 
 /* ---- stats ---- */
 static void cmd_stats(void) {
-    /* 種類集計 */
     const char *types[64]; int tcnt[64]; int tn=0;
     long tot_pop=0; int deprecated=0;
     int i,j;
@@ -589,7 +1411,6 @@ static void cmd_stats(void) {
         if(!found&&tn<64){types[tn]=p->type;tcnt[tn++]=1;}
     }
 
-    /* 種類を件数降順にソート (バブル) */
     for(i=0;i<tn-1;i++) for(j=i+1;j<tn;j++)
         if(tcnt[j]>tcnt[i]){
             int tmp=tcnt[i];tcnt[i]=tcnt[j];tcnt[j]=tmp;
@@ -604,7 +1425,6 @@ static void cmd_stats(void) {
     C(1); printf("総人気度        : "); C_RESET; printf("%ld\n",tot_pop);
     printf("\n");
 
-    /* 種類別バー */
     C(1); printf("種類別:\n"); C_RESET;
     int bar_max=tcnt[0]>0?tcnt[0]:1;
     for(i=0;i<tn;i++){
@@ -618,7 +1438,6 @@ static void cmd_stats(void) {
     }
     printf("\n");
 
-    /* 人気 Top10 */
     int all_idx[MAX_PKG];
     for(i=0;i<g_count;i++) all_idx[i]=i;
     qsort(all_idx,g_count,sizeof(int),cmp_pop);
@@ -639,8 +1458,7 @@ static void cmd_stats(void) {
 
 /* ---- update ---- */
 static void cmd_update(void) {
-    /* キャッシュ削除して再取得 */
-    char path[1024]; cache_path(path,sizeof(path));
+    char path[1024]; home_path(path,sizeof(path),CACHE_FILE);
     remove(path);
     g_count=0;
 
@@ -663,27 +1481,40 @@ static void cmd_help(const char *prog) {
     C(1); printf("使い方:\n"); C_RESET;
     printf("  %s <コマンド> [オプション]\n\n",prog);
     C(1); printf("コマンド:\n"); C_RESET;
-    printf("  "); C(32); printf("search"); C_RESET;  printf("  <キーワード>    パッケージを検索 (名前 / 作者 / 概要 / タグ)\n");
-    printf("  "); C(32); printf("list"); C_RESET;    printf("    [種類]         パッケージ一覧 (種類で絞込可)\n");
-    printf("  "); C(32); printf("show"); C_RESET;    printf("    <ID|名前>      パッケージの詳細情報\n");
-    printf("  "); C(32); printf("info"); C_RESET;    printf("    <ID|名前>      show の別名\n");
-    printf("  "); C(32); printf("stats"); C_RESET;   printf("                  データベース統計\n");
-    printf("  "); C(32); printf("update"); C_RESET;  printf("                  カタログを強制更新\n");
-    printf("  "); C(32); printf("help"); C_RESET;    printf("                  このヘルプ\n");
+    printf("  "); C(32); printf("search"); C_RESET;    printf("    <キーワード>    パッケージを検索 (名前 / 作者 / 概要 / タグ)\n");
+    printf("  "); C(32); printf("list"); C_RESET;      printf("      [種類]         パッケージ一覧 (種類で絞込可)\n");
+    printf("  "); C(32); printf("show"); C_RESET;      printf("      <ID|名前>      パッケージの詳細情報\n");
+    printf("  "); C(32); printf("info"); C_RESET;      printf("      <ID|名前>      show の別名\n");
+    printf("  "); C(32); printf("install"); C_RESET;   printf("   <ID|名前> [-y] パッケージをインストール\n");
+    printf("  "); C(32); printf("uninstall"); C_RESET; printf(" <ID|名前> [-y] パッケージをアンインストール (remove/rm でも可)\n");
+    printf("  "); C(32); printf("config"); C_RESET;    printf("    [--app-dir <パス>] [--plugins-dir <パス>]\n");
+    printf("                            インストール先設定の表示/変更\n");
+    printf("  "); C(32); printf("stats"); C_RESET;     printf("                    データベース統計\n");
+    printf("  "); C(32); printf("update"); C_RESET;    printf("                    カタログを強制更新\n");
+    printf("  "); C(32); printf("help"); C_RESET;      printf("                    このヘルプ\n");
     printf("\n");
     C(1); printf("例:\n"); C_RESET;
     printf("  %s search x264\n",prog);
     printf("  %s search rigaya\n",prog);
     printf("  %s list スクリプト\n",prog);
     printf("  %s show x264guiEx\n",prog);
-    printf("  %s show Mr-Ojii.L-SMASH-Works\n",prog);
-    printf("  %s update\n",prog);
+    printf("  %s install Mr-Ojii.L-SMASH-Works\n",prog);
+    printf("  %s install x264guiEx -y\n",prog);
+    printf("  %s uninstall x264guiEx\n",prog);
+    printf("  %s config --app-dir \"C:\\\\AviUtl2\"\n",prog);
+    printf("\n");
+    C(1); printf("インストール機能について:\n"); C_RESET;
+    printf("  - zip展開・ファイルコピーは全OSで動作します。\n");
+    printf("  - exe実行 (run / run_auo_setup / extract_sfx) は Windows、または\n");
+    printf("    非Windows環境で wine が見つかった場合のみ動作します。\n");
+    printf("  - appDir / pluginsDir は初回 install/uninstall 時に質問されます。\n");
+    printf("    au2cat config で確認・変更できます。\n");
     printf("\n");
     C(1); printf("データ元:\n"); C_RESET;
     printf("  %s\n",INDEX_URL);
     printf("\n");
     C(1); printf("キャッシュ:\n"); C_RESET;
-    char path[1024]; cache_path(path,sizeof(path));
+    char path[1024]; home_path(path,sizeof(path),CACHE_FILE);
     printf("  %s  (TTL: %d 分)\n",path,CACHE_TTL/60);
     printf("\n");
 }
@@ -698,7 +1529,6 @@ color_init();
 
 const char *prog = argc > 0 ? argv[0] : "au2cat";
 
-/* サブコマンド / オプション取得 */
 if (argc < 2) {
     cmd_help(prog);
     return 0;
@@ -712,6 +1542,12 @@ if (!strcmp(cmd, "help") ||
     !strcmp(cmd, "--help")) {
 
     cmd_help(prog);
+    return 0;
+}
+
+/* config もカタログ不要 */
+if (!strcmp(cmd, "config") || !strcmp(cmd, "--config")) {
+    cmd_config(argc-2, argv+2);
     return 0;
 }
 
@@ -756,6 +1592,22 @@ if (!strcmp(cmd, "search") ||
            !strcmp(cmd, "--info")) {
 
     cmd_show(argc - 2, argv + 2);
+
+} else if (!strcmp(cmd, "install") ||
+           !strcmp(cmd, "--install")) {
+
+    int ac = argc - 2; char **av = argv + 2;
+    int yes = extract_yes_flag(&ac, av);
+    cmd_install(ac, av, yes);
+
+} else if (!strcmp(cmd, "uninstall") ||
+           !strcmp(cmd, "remove") ||
+           !strcmp(cmd, "rm") ||
+           !strcmp(cmd, "--uninstall")) {
+
+    int ac = argc - 2; char **av = argv + 2;
+    int yes = extract_yes_flag(&ac, av);
+    cmd_uninstall(ac, av, yes);
 
 } else if (!strcmp(cmd, "stats") ||
            !strcmp(cmd, "--stats")) {
