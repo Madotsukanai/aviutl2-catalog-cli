@@ -48,6 +48,9 @@
 #include <curl/curl.h>
 #include <zip.h>
 
+#define XXH_INLINE_ALL
+#include "xxhash.h"
+
 #ifdef _WIN32
 #  include <windows.h>
 #  include <shellapi.h>
@@ -152,6 +155,13 @@ typedef struct {
     int  deprecated;
     Installer installer;
     int  has_installer;
+    char niconi_commons[MAX_STR];
+    struct {
+        char version[MAX_STR];
+        struct { char path[256]; char xxh128[33]; } files[16];
+        int file_count;
+    } versions[16];
+    int version_count;
 } Package;
 
 static Package g_pkg[MAX_PKG];
@@ -321,6 +331,46 @@ static const char *parse_installer(const char *p, Installer *ins) {
                     if(!strcmp(skey,"direct")){
                         p=parse_str(p,ins->direct_url,sizeof(ins->direct_url));
                         ins->is_github=0;
+                    } else if(!strcmp(skey,"googleDrive")){
+                        p=skip_ws(p);
+                        if(*p=='{'){
+                            p++; p=skip_ws(p);
+                            while(*p && *p!='}'){
+                                char gkey[64];
+                                p=skip_ws(p); if(*p!='"') break;
+                                p=parse_str(p,gkey,sizeof(gkey)); if(!p) return NULL;
+                                p=skip_ws(p); if(*p==':')p++; p=skip_ws(p);
+                                if(!strcmp(gkey,"id")) {
+                                    char gid[128]; p=parse_str(p,gid,sizeof(gid));
+                                    snprintf(ins->direct_url,sizeof(ins->direct_url),"gdrive:%s",gid);
+                                }
+                                else p=skip_val(p);
+                                if(!p) return NULL;
+                                p=skip_ws(p); if(*p==',')p++; p=skip_ws(p);
+                            }
+                            if(*p=='}')p++;
+                        }
+                        ins->is_github=0;
+                    } else if(!strcmp(skey,"booth")){
+                        p=skip_ws(p);
+                        if(*p=='{'){
+                            p++; p=skip_ws(p);
+                            while(*p && *p!='}'){
+                                char gkey[64];
+                                p=skip_ws(p); if(*p!='"') break;
+                                p=parse_str(p,gkey,sizeof(gkey)); if(!p) return NULL;
+                                p=skip_ws(p); if(*p==':')p++; p=skip_ws(p);
+                                if(!strcmp(gkey,"url")) {
+                                    char b[256]; p=parse_str(p,b,sizeof(b));
+                                    snprintf(ins->direct_url,sizeof(ins->direct_url),"booth:%s",b);
+                                }
+                                else p=skip_val(p);
+                                if(!p) return NULL;
+                                p=skip_ws(p); if(*p==',')p++; p=skip_ws(p);
+                            }
+                            if(*p=='}')p++;
+                        }
+                        ins->is_github=0;
                     } else if(!strcmp(skey,"github")){
                         ins->is_github=1;
                         p=skip_ws(p);
@@ -406,6 +456,74 @@ static const char *parse_pkg(const char *p, Package *pk) {
                     if(*p=='"'&&pk->dep_count<MAX_DEPS) p=parse_str(p,pk->deps[pk->dep_count++],MAX_STR);
                     else p=skip_val(p);
                     if(!p)return NULL;
+                    p=skip_ws(p); if(*p==',')p++; p=skip_ws(p);
+                }
+                if(*p==']')p++;
+            } else p=skip_val(p);
+        }
+        else if(!strcmp(key,"niconiCommonsId")) {
+            if(*p=='"') p=parse_str(p,pk->niconi_commons,MAX_STR);
+            else if(*p=='n') { p+=4; pk->niconi_commons[0] = '\0'; }
+            else p=skip_val(p);
+        }
+        else if(!strcmp(key,"version")) {
+            if(*p=='['){
+                p++; p=skip_ws(p);
+                while(*p&&*p!=']'){
+                    if(*p=='{'){
+                        p++; p=skip_ws(p);
+                        int vc;
+                        if(pk->version_count<16){
+                            vc = pk->version_count++;
+                        } else {
+                            int k;
+                            for(k=0; k<15; k++) pk->versions[k] = pk->versions[k+1];
+                            vc = 15;
+                        }
+                        pk->versions[vc].file_count = 0;
+                        while(*p&&*p!='}'){
+                            char vkey[64];
+                            p=skip_ws(p); if(*p!='"') break;
+                            p=parse_str(p,vkey,sizeof(vkey)); if(!p) return NULL;
+                            p=skip_ws(p); if(*p==':')p++; p=skip_ws(p);
+                            if(!strcmp(vkey,"version")) p=parse_str(p,pk->versions[vc].version,MAX_STR);
+                            else if(!strcmp(vkey,"file")){
+                                if(*p=='['){
+                                    p++; p=skip_ws(p);
+                                    while(*p&&*p!=']'){
+                                        if(*p=='{'){
+                                            int fc;
+                                            if(pk->versions[vc].file_count<16){
+                                                fc = pk->versions[vc].file_count++;
+                                            } else {
+                                                int k;
+                                                for(k=0; k<15; k++) pk->versions[vc].files[k] = pk->versions[vc].files[k+1];
+                                                fc = 15;
+                                            }
+                                            p++; p=skip_ws(p);
+                                            pk->versions[vc].files[fc].path[0] = '\0';
+                                            pk->versions[vc].files[fc].xxh128[0] = '\0';
+                                            while(*p&&*p!='}'){
+                                                char fkey[64];
+                                                p=skip_ws(p); if(*p!='"') break;
+                                                p=parse_str(p,fkey,sizeof(fkey)); if(!p) return NULL;
+                                                p=skip_ws(p); if(*p==':')p++; p=skip_ws(p);
+                                                if(!strcmp(fkey,"path")) p=parse_str(p,pk->versions[vc].files[fc].path,256);
+                                                else if(!strcmp(fkey,"XXH3_128")) p=parse_str(p,pk->versions[vc].files[fc].xxh128,33);
+                                                else p=skip_val(p);
+                                                p=skip_ws(p); if(*p==',')p++; p=skip_ws(p);
+                                            }
+                                            if(*p=='}')p++;
+                                        } else p=skip_val(p);
+                                        p=skip_ws(p); if(*p==',')p++; p=skip_ws(p);
+                                    }
+                                    if(*p==']')p++;
+                                } else p=skip_val(p);
+                            } else p=skip_val(p);
+                            p=skip_ws(p); if(*p==',')p++; p=skip_ws(p);
+                        }
+                        if(*p=='}')p++;
+                    } else p=skip_val(p);
                     p=skip_ws(p); if(*p==',')p++; p=skip_ws(p);
                 }
                 if(*p==']')p++;
@@ -820,6 +938,14 @@ static int resolve_source(Package *pkg, char *url_out, size_t url_sz, char *name
     Installer *ins=&pkg->installer;
     if(!ins->is_github){
         if(!ins->direct_url[0]){ fprintf(stderr,"au2cat: ダウンロード元が設定されていません\n"); return 0; }
+        if(!strncmp(ins->direct_url,"gdrive:",7)){
+            snprintf(url_out,url_sz,"https://drive.google.com/uc?export=download&id=%s",ins->direct_url+7);
+            snprintf(name_out,name_sz,"download.zip");
+            return 1;
+        } else if(!strncmp(ins->direct_url,"booth:",6)){
+            fprintf(stderr,"au2cat: BOOTHからの自動ダウンロードはCLIではサポートされていません。\n手動でダウンロードして展開してください: %s\n",ins->direct_url+6);
+            return 0;
+        }
         snprintf(url_out,url_sz,"%s",ins->direct_url);
         const char *base=strrchr(ins->direct_url,'/');
         snprintf(name_out,name_sz,"%s", base?base+1:ins->direct_url);
@@ -1025,13 +1151,29 @@ static void append_str(char *out, size_t outsz, size_t *oi, const char *s){
     if(l>0){ memcpy(out+*oi,s,l); *oi+=l; }
 }
 
-static void resolve_path(const char *tmpl, InstallCtx *ctx, Config *cfg, char *out, size_t outsz) {
+static void resolve_path_base(const char *tmpl, Config *cfg, char *out, size_t outsz) {
     size_t oi=0; out[0]='\0';
     const char *p=tmpl;
     while(*p){
-        if(!strncmp(p,"{tmp}",5)){ append_str(out,outsz,&oi,ctx->pkg_tmp_dir); p+=5; }
-        else if(!strncmp(p,"{appDir}",8)){ append_str(out,outsz,&oi,cfg->app_dir); p+=8; }
+        if(!strncmp(p,"{appDir}",8)){ append_str(out,outsz,&oi,cfg->app_dir); p+=8; }
         else if(!strncmp(p,"{pluginsDir}",12)){ append_str(out,outsz,&oi,cfg->plugins_dir); p+=12; }
+        else if(!strncmp(p,"{scriptsDir}",12)){
+            char buf[1024]; snprintf(buf,sizeof(buf),"%s/script",cfg->app_dir);
+            append_str(out,outsz,&oi,buf); p+=12;
+        }
+        else if(!strncmp(p,"{dataDir}",9)){ append_str(out,outsz,&oi,cfg->app_dir); p+=9; }
+        else { char c[2]; c[0]=*p; c[1]='\0'; append_str(out,outsz,&oi,c); p++; }
+    }
+    if(oi<outsz) out[oi]='\0'; else out[outsz-1]='\0';
+}
+
+static void resolve_path(const char *tmpl, InstallCtx *ctx, Config *cfg, char *out, size_t outsz) {
+    char base[1024];
+    resolve_path_base(tmpl, cfg, base, sizeof(base));
+    size_t oi=0; out[0]='\0';
+    const char *p=base;
+    while(*p){
+        if(!strncmp(p,"{tmp}",5)){ append_str(out,outsz,&oi,ctx->pkg_tmp_dir); p+=5; }
         else if(!strncmp(p,"{download}",10)){ append_str(out,outsz,&oi,ctx->download_path); p+=10; }
         else { char c[2]; c[0]=*p; c[1]='\0'; append_str(out,outsz,&oi,c); p++; }
     }
@@ -1140,6 +1282,159 @@ static int extract_yes_flag(int *argc, char **argv) {
 
 /* ===== サブコマンド実装 ===== */
 
+
+/* ===== XXH3_128 チェック ===== */
+static int check_package_version(Package *p, Config *cfg, int *has_files_out) {
+    if(has_files_out) *has_files_out = 0;
+    if(p->version_count==0) return -1;
+    
+    int v;
+    for(v=p->version_count-1; v>=0; v--) {
+        if(p->versions[v].file_count==0) continue;
+        if(has_files_out) *has_files_out = 1;
+        int ok = 1;
+        int f;
+        for(f=0; f<p->versions[v].file_count; f++) {
+            char path[1024];
+            resolve_path_base(p->versions[v].files[f].path, cfg, path, sizeof(path));
+            FILE *file = fopen(path, "rb");
+            if(!file) { ok=0; break; }
+            
+            XXH3_state_t* state = XXH3_createState();
+            XXH3_128bits_reset(state);
+            char buf[8192];
+            size_t rd;
+            while((rd = fread(buf, 1, sizeof(buf), file)) > 0) {
+                XXH3_128bits_update(state, buf, rd);
+            }
+            fclose(file);
+            XXH128_hash_t hash = XXH3_128bits_digest(state);
+            XXH3_freeState(state);
+            
+            char hex[33];
+            snprintf(hex, sizeof(hex), "%016llx%016llx", (unsigned long long)hash.high64, (unsigned long long)hash.low64);
+            
+            if(p->versions[v].files[f].xxh128[0] != '\0' && strcmp(hex, p->versions[v].files[f].xxh128) != 0) {
+                ok=0; break;
+            }
+        }
+        if(ok) return v;
+    }
+    return -1;
+}
+
+/* ---- check ---- */
+static void cmd_check(void) {
+    Config cfg; ensure_config(&cfg);
+    C(33); printf(":: "); C_RESET;
+    printf("インストール済みのパッケージを検出しています...\n\n");
+    
+    int found_count = 0;
+    int i;
+    for(i=0; i<g_count; i++) {
+        int v = check_package_version(&g_pkg[i], &cfg, NULL);
+        if(v >= 0) {
+            C(32); printf("[OK] "); C_RESET;
+            printf("%-40s ", g_pkg[i].name);
+            C(90); printf("(%s) ", g_pkg[i].id); C_RESET;
+            C(35); printf("%s", g_pkg[i].versions[v].version); C_RESET;
+            if(strcmp(g_pkg[i].versions[v].version, g_pkg[i].latest_version) != 0) {
+                printf(" (最新: "); C(33); printf("%s", g_pkg[i].latest_version); C_RESET; printf(")");
+            }
+            printf("\n");
+            found_count++;
+        }
+    }
+    if(found_count == 0) {
+        printf("  インストールされているパッケージが見つかりませんでした。\n");
+    } else {
+        printf("\n計 %d 件のパッケージが検出されました。\n", found_count);
+    }
+}
+
+/* ---- upgrade ---- */
+static void cmd_upgrade(int assume_yes) {
+    Config cfg; ensure_config(&cfg);
+    C(33); printf(":: "); C_RESET;
+    printf("更新可能なパッケージを確認しています...\n\n");
+    
+    Package *to_upgrade[MAX_PKG];
+    int upgrade_count = 0;
+    
+    int i;
+    for(i=0; i<g_count; i++) {
+        int v = check_package_version(&g_pkg[i], &cfg, NULL);
+        if(v >= 0) {
+            if(strcmp(g_pkg[i].versions[v].version, g_pkg[i].latest_version) != 0) {
+                if(g_pkg[i].has_installer && g_pkg[i].installer.install_count > 0) {
+                    to_upgrade[upgrade_count++] = &g_pkg[i];
+                }
+            }
+        }
+    }
+    
+    if(upgrade_count == 0) {
+        printf("  更新可能なパッケージはありません。\n");
+        return;
+    }
+    
+    C(1); printf("以下のパッケージが更新されます:\n"); C_RESET;
+    for(i=0; i<upgrade_count; i++) {
+        printf("  %s (-> %s)\n", to_upgrade[i]->name, to_upgrade[i]->latest_version);
+    }
+    printf("\n");
+    
+    if(!assume_yes && !confirm_yes("更新を続行しますか?")) {
+        printf("中止しました。\n");
+        return;
+    }
+    
+    for(i=0; i<upgrade_count; i++) {
+        Package *p = to_upgrade[i];
+        C(33); printf(":: "); C_RESET; printf("更新中: %s\n", p->name);
+        
+        InstallCtx ctx; memset(&ctx,0,sizeof(ctx));
+        char home[1024]; const char *h=getenv(HOME_ENV);
+        snprintf(home,sizeof(home),"%s",h?h:".");
+        snprintf(ctx.pkg_tmp_dir,sizeof(ctx.pkg_tmp_dir),"%s%c%s%c%s",home,PATH_SEP,TMP_DIRNAME,PATH_SEP,p->id);
+        mkdir_p(ctx.pkg_tmp_dir);
+        
+        int ok=1;
+        int j;
+        for(j=0; j<p->installer.install_count && ok; j++) {
+            ok = exec_action(&p->installer.install_actions[j], &ctx, &cfg, p);
+        }
+        if(ok) { C(32); printf(":: "); C_RESET; printf("更新完了: %s\n", p->name); }
+        else   { C(31); printf(":: "); C_RESET; printf("更新に失敗しました: %s\n", p->name); }
+    }
+}
+
+/* ---- commons ---- */
+static void cmd_commons(void) {
+    Config cfg; ensure_config(&cfg);
+    C(33); printf(":: "); C_RESET;
+    printf("インストール済みパッケージのニコニ・コモンズIDを抽出しています...\n\n");
+    
+    char all_ids[MAX_STR * MAX_PKG] = "";
+    int first = 1;
+    int i;
+    for(i=0; i<g_count; i++) {
+        int v = check_package_version(&g_pkg[i], &cfg, NULL);
+        if(v >= 0 && g_pkg[i].niconi_commons[0] != '\0') {
+            if(!first) strncat(all_ids, ",", sizeof(all_ids) - strlen(all_ids) - 1);
+            strncat(all_ids, g_pkg[i].niconi_commons, sizeof(all_ids) - strlen(all_ids) - 1);
+            first = 0;
+            printf("  %s (%s)\n", g_pkg[i].niconi_commons, g_pkg[i].name);
+        }
+    }
+    if(first) {
+        printf("  対応するパッケージは見つかりませんでした。\n");
+    } else {
+        printf("\nコモンズID一覧 (カンマ区切り):\n");
+        C(32); printf("%s\n", all_ids); C_RESET;
+    }
+}
+
 /* ---- search ---- */
 static void cmd_search(int argc, char **argv) {
     char query[MAX_STR]="";
@@ -1177,9 +1472,10 @@ static void cmd_search(int argc, char **argv) {
     }
 
     C(1);
-    printf("%-40s  %-14s  %-14s  %s\n","名前","作者","種類","バージョン");
+    printf("%-40s  %-40s  %-14s  %-14s  %s\n","名前","ID","作者","種類","バージョン");
     C_RESET;
-    printf("%-40s  %-14s  %-14s  %s\n",
+    printf("%-40s  %-40s  %-14s  %-14s  %s\n",
+        "----------------------------------------",
         "----------------------------------------",
         "--------------","--------------","----------");
 
@@ -1187,6 +1483,8 @@ static void cmd_search(int argc, char **argv) {
         Package *p=&g_pkg[idx[i]];
         if(p->deprecated){ C(31); printf("(非推奨) "); C_RESET; print_cell(p->name,31); }
         else              { C(32); print_cell(p->name,40); C_RESET; }
+        printf("  ");
+        C(90); print_cell(p->id,40); C_RESET;
         printf("  ");
         C(33); print_cell(p->author,14); C_RESET;
         printf("  ");
@@ -1217,9 +1515,10 @@ static void cmd_list(int argc, char **argv) {
     else               printf("パッケージ一覧 (全種類)  %d 件\n\n",cnt);
 
     C(1);
-    printf("%-40s  %-14s  %-14s  %s\n","名前","作者","種類","バージョン");
+    printf("%-40s  %-40s  %-14s  %-14s  %s\n","名前","ID","作者","種類","バージョン");
     C_RESET;
-    printf("%-40s  %-14s  %-14s  %s\n",
+    printf("%-40s  %-40s  %-14s  %-14s  %s\n",
+        "----------------------------------------",
         "----------------------------------------",
         "--------------","--------------","----------");
 
@@ -1227,6 +1526,8 @@ static void cmd_list(int argc, char **argv) {
         Package *p=&g_pkg[idx[i]];
         if(p->deprecated){ C(31); print_cell(p->name,40); C_RESET; }
         else              { C(32); print_cell(p->name,40); C_RESET; }
+        printf("  ");
+        C(90); print_cell(p->id,40); C_RESET;
         printf("  ");
         C(33); print_cell(p->author,14); C_RESET;
         printf("  ");
@@ -1265,6 +1566,16 @@ static void cmd_show(int argc, char **argv) {
     C(1); printf("%-16s","種類"); C_RESET; printf(": %s\n",p->type);
     C(1); printf("%-16s","作者"); C_RESET; printf(": %s\n",p->author);
     C(1); printf("%-16s","人気度"); C_RESET; printf(": %ld  トレンド: %ld\n",p->popularity,p->trend);
+    Config cfg; ensure_config(&cfg);
+    int has_files = 0;
+    int v = check_package_version(p, &cfg, &has_files);
+    C(1); printf("%-16s","インストール状態"); C_RESET; printf(": ");
+    if(v >= 0) {
+        C(32); printf("インストール済み (%s)\n", p->versions[v].version); C_RESET;
+    } else {
+        if(has_files) printf("未インストール (ファイル未検出)\n");
+        else printf("検出情報なし (ハッシュ未登録)\n");
+    }
 
     if(p->repo_url[0]){
         C(1); printf("%-16s","URL"); C_RESET; printf(": "); C(34); printf("%s",p->repo_url); C_RESET; printf("\n");
@@ -1489,6 +1800,9 @@ static void cmd_help(const char *prog) {
     printf("  "); C(32); printf("uninstall"); C_RESET; printf(" <ID|名前> [-y] パッケージをアンインストール (remove/rm でも可)\n");
     printf("  "); C(32); printf("config"); C_RESET;    printf("    [--app-dir <パス>] [--plugins-dir <パス>]\n");
     printf("                            インストール先設定の表示/変更\n");
+    printf("  "); C(32); printf("check"); C_RESET;     printf("                    インストール済みパッケージを検出\n");
+    printf("  "); C(32); printf("upgrade"); C_RESET;   printf("                  更新可能なパッケージを一括更新\n");
+    printf("  "); C(32); printf("commons"); C_RESET;   printf("                  ニコニ・コモンズIDをまとめてコピー用に出力\n");
     printf("  "); C(32); printf("stats"); C_RESET;     printf("                    データベース統計\n");
     printf("  "); C(32); printf("update"); C_RESET;    printf("                    カタログを強制更新\n");
     printf("  "); C(32); printf("help"); C_RESET;      printf("                    このヘルプ\n");
@@ -1593,6 +1907,14 @@ if (!strcmp(cmd, "search") ||
 
     cmd_show(argc - 2, argv + 2);
 
+} else if (!strcmp(cmd, "check")) {
+    cmd_check();
+} else if (!strcmp(cmd, "upgrade")) {
+    int ac = argc - 2; char **av = argv + 2;
+    int yes = extract_yes_flag(&ac, av);
+    cmd_upgrade(yes);
+} else if (!strcmp(cmd, "commons")) {
+    cmd_commons();
 } else if (!strcmp(cmd, "install") ||
            !strcmp(cmd, "--install")) {
 
