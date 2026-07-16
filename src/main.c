@@ -49,7 +49,7 @@ static void safe_strcat(char *dst, size_t dst_sz, const char *src) {
 #endif
 
 /* ===== 定数 ===== */
-#define AU2CAT_VERSION "v0.1.1"
+#define AU2CAT_VERSION "v0.1.2"
 #define INDEX_URL    "https://raw.githubusercontent.com/Neosku/aviutl2-catalog-data/main/index.json"
 #define CACHE_FILE   "au2cat_cache.json"   /* ホームディレクトリ内 */
 #define CACHE_TTL    1800                  /* 30分 (秒) */
