@@ -124,7 +124,7 @@ debug:
 # ---------- クリーン ----------
 clean:
 	$(RM) $(TARGET_UNIX) $(TARGET_UNIX)_debug 2>/dev/null; true
-	$(RM) -r .zig-cache zig-out 2>/dev/null; true
+	$(RM) -r .zig-cache zig-out zig-pkg 2>/dev/null; true
 	@echo "  ✔ クリーン完了"
 
 # ---------- インストール ----------

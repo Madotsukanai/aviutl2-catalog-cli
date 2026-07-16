@@ -1,42 +1,5 @@
-/*
- * au2cat — AviUtl2 Catalog CLI
- * パッケージマネージャー風 CLI (apt / pacman スタイル)
- *
- * 使い方:
- *   au2cat search    <キーワード>          パッケージを検索
- *   au2cat list      [種類]                パッケージ一覧
- *   au2cat show      <id|名前>             パッケージ詳細
- *   au2cat info      <id|名前>             show の別名
- *   au2cat install   <id|名前> [-y]        パッケージをインストール
- *   au2cat uninstall <id|名前> [-y]        パッケージをアンインストール (remove/rm でも可)
- *   au2cat config    [--app-dir <path>] [--plugins-dir <path>]
- *                                          インストール先の設定を表示/変更
- *   au2cat stats                           統計情報
- *   au2cat update                          カタログ更新確認
- *   au2cat help                            このヘルプ
- *
- * ビルド:
- *   Linux/macOS : gcc -O2 -o au2cat main.c -lcurl -lzip -lm
- *   Windows     : gcc -O2 -o au2cat.exe main.c -lcurl -lzip -lws2_32 -lm
- *
- * 依存: libcurl, libzip
- *
- * --- install / uninstall について ---
- * カタログ index.json の "installer" フィールドに従って、ダウンロード ->
- * (zip)展開 -> ファイルコピー、または exe 実行 (Windows / Wine) を行います。
- *
- *   - 対応プラットフォーム: クロスプラットフォーム (zip展開・ファイルコピー
- *     は全OSで動作)。ただし exe を実行するアクション (run / run_auo_setup /
- *     extract_sfx) は Windows ネイティブ、または非Windows環境で `wine` が
- *     PATH 上に見つかった場合のみ実行されます。見つからない場合はそのアク
- *     ションをスキップして警告を表示します。
- *   - extract_sfx は 7-Zip SFX 形式を想定し `-o"<dest>" -y` を付与して実行
- *     するベストエフォート実装です。SFX の実装によっては動作しない場合が
- *     あります。
- *   - appDir / pluginsDir (AviUtl2 のインストール先) は ~/au2cat_config.json
- *     に保存されます。未設定の場合、初回の install/uninstall 実行時に対話
- *     的に質問します。`au2cat config` で確認・変更できます。
- */
+#define _DEFAULT_SOURCE
+#define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -86,6 +49,7 @@ static void safe_strcat(char *dst, size_t dst_sz, const char *src) {
 #endif
 
 /* ===== 定数 ===== */
+#define AU2CAT_VERSION "v0.1.1"
 #define INDEX_URL    "https://raw.githubusercontent.com/Neosku/aviutl2-catalog-data/main/index.json"
 #define CACHE_FILE   "au2cat_cache.json"   /* ホームディレクトリ内 */
 #define CACHE_TTL    1800                  /* 30分 (秒) */
@@ -1515,7 +1479,74 @@ static void cmd_check(void) {
 }
 
 /* ---- upgrade ---- */
+static void upgrade_cli_if_available(int assume_yes) {
+    char path[1024]; home_path(path, sizeof(path), "au2cat_cli_update.txt");
+    FILE *f = fopen(path, "r");
+    if(!f) return;
+    
+    char tag[64];
+    if(fscanf(f, "%63s", tag) == 1) {
+        fclose(f);
+        C(36); printf(":: "); C_RESET;
+        printf(_("au2cat 本体の新しいバージョン (%s) が利用可能です。\n"), tag);
+        
+        if(!assume_yes) {
+            printf(_("本体を更新しますか？ [Y/n] "));
+            char ans[16];
+            if(fgets(ans, sizeof(ans), stdin) && (ans[0]=='n' || ans[0]=='N')) {
+                return;
+            }
+        }
+        
+        C(33); printf(":: "); C_RESET;
+        printf(_("本体をダウンロード中...\n"));
+#ifdef _WIN32
+        const char *url = "https://github.com/Madotsukanai/aviutl2-catalog-cli/releases/latest/download/au2cat.exe";
+        char exe_path[MAX_PATH];
+        GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+        char old_path[MAX_PATH];
+        snprintf(old_path, sizeof(old_path), "%s.old", exe_path);
+        remove(old_path);
+        MoveFileExA(exe_path, old_path, MOVEFILE_REPLACE_EXISTING);
+        if(download_to_file(url, exe_path)) {
+            C(32); printf(":: "); C_RESET;
+            printf(_("本体の更新が完了しました！ (%s)\n"), tag);
+            remove(path);
+            exit(0);
+        } else {
+            MoveFileExA(old_path, exe_path, MOVEFILE_REPLACE_EXISTING);
+            fprintf(stderr, _("au2cat: 本体の更新に失敗しました。\n"));
+        }
+#else
+        const char *url = "https://github.com/Madotsukanai/aviutl2-catalog-cli/releases/latest/download/au2cat";
+        char exe_path[1024];
+        ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path)-1);
+        if(len != -1) {
+            exe_path[len] = '\0';
+        } else {
+            strcpy(exe_path, "au2cat");
+        }
+        char tmp_path[1024];
+        snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", exe_path);
+        if(download_to_file(url, tmp_path)) {
+            chmod(tmp_path, 0755);
+            rename(tmp_path, exe_path);
+            C(32); printf(":: "); C_RESET;
+            printf(_("本体の更新が完了しました！ (%s)\n"), tag);
+            remove(path);
+            exit(0);
+        } else {
+            fprintf(stderr, _("au2cat: 本体の更新に失敗しました。\n"));
+        }
+#endif
+    } else {
+        fclose(f);
+    }
+}
+
 static void cmd_upgrade(int assume_yes) {
+    upgrade_cli_if_available(assume_yes);
+    
     Config cfg; ensure_config(&cfg);
     C(33); printf(":: "); C_RESET;
     printf(_( "更新可能なパッケージを確認しています...\n\n" ));
@@ -1989,6 +2020,35 @@ static void cmd_stats(void) {
     printf("\n");
 }
 
+static void check_cli_update(void) {
+    char *json = http_get("https://api.github.com/repos/Madotsukanai/aviutl2-catalog-cli/releases/latest");
+    if(json) {
+        char *p = strstr(json, "\"tag_name\"");
+        if(p) {
+            p = strchr(p, ':');
+            if(p) {
+                p = (char*)skip_ws(p);
+                char tag[64];
+                if(parse_str(p, tag, sizeof(tag))) {
+                    if(strcmp(tag, AU2CAT_VERSION) != 0) {
+                        C(36); printf("\n:: "); C_RESET;
+                        printf(_("au2cat 本体の新しいバージョンが利用可能です: %s (現在: %s)\n"), tag, AU2CAT_VERSION);
+                        printf(_("   'au2cat upgrade' で本体を更新できます。\n\n"));
+                        
+                        char path[1024]; home_path(path, sizeof(path), "au2cat_cli_update.txt");
+                        FILE *f = fopen(path, "w");
+                        if(f) { fprintf(f, "%s\n", tag); fclose(f); }
+                    } else {
+                        char path[1024]; home_path(path, sizeof(path), "au2cat_cli_update.txt");
+                        remove(path);
+                    }
+                }
+            }
+        }
+        free(json);
+    }
+}
+
 /* ---- update ---- */
 static void cmd_update(void) {
     char path[1024]; home_path(path,sizeof(path),CACHE_FILE);
@@ -2005,6 +2065,8 @@ static void cmd_update(void) {
     if(!ok){ fprintf(stderr,_( "au2cat: パースエラー\n" )); return; }
     C(32); printf(":: "); C_RESET;
     printf(_( "更新完了  —  %d 件のパッケージ\n" ),g_count);
+    
+    check_cli_update();
 }
 
 /* ---- help ---- */
@@ -2027,6 +2089,7 @@ static void cmd_help(const char *prog) {
     printf("  "); C(32); printf("commons"); C_RESET;   printf(_( "                  ニコニ・コモンズIDをまとめてコピー用に出力\n" ));
     printf("  "); C(32); printf("stats"); C_RESET;     printf(_( "                    データベース統計\n" ));
     printf("  "); C(32); printf("update"); C_RESET;    printf(_( "                    カタログを強制更新\n" ));
+    printf("  "); C(32); printf("version"); C_RESET;   printf(_( "                   バージョン情報を表示\n" ));
     printf("  "); C(32); printf("help"); C_RESET;      printf(_( "                    このヘルプ\n" ));
     printf("\n");
     C(1); printf(_( "例:\n" )); C_RESET;
@@ -2078,6 +2141,14 @@ if (!strcmp(cmd, "help") ||
     !strcmp(cmd, "--help")) {
 
     cmd_help(prog);
+    return 0;
+}
+
+if (!strcmp(cmd, "version") ||
+    !strcmp(cmd, "-v") ||
+    !strcmp(cmd, "--version")) {
+    
+    printf("au2cat %s\n", AU2CAT_VERSION);
     return 0;
 }
 
