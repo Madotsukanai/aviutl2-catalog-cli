@@ -45,8 +45,8 @@ ifeq ($(PLATFORM),windows)
     # Windows は Zig ビルドを使用するため、出力パスは zig-out 配下になる
     TARGET := zig-out/bin/$(TARGET_WIN)
 else
-    # Linux / macOS
-    TARGET := $(TARGET_UNIX)
+    # Linux / macOS (Windowsと統一して zig-out/bin に出力する)
+    TARGET := zig-out/bin/$(TARGET_UNIX)
     CURL_CFLAGS ?= $(shell pkg-config --cflags libcurl 2>/dev/null || curl-config --cflags 2>/dev/null)
     CURL_LIBS   ?= $(shell pkg-config --libs   libcurl 2>/dev/null || curl-config --libs   2>/dev/null || echo -lcurl)
     LDFLAGS     += $(CURL_LIBS) -lm
@@ -102,6 +102,7 @@ endif
 	@echo "  ✔ Windows向けビルド完了: $(TARGET)"
 	@echo ""
 else
+	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS)
 	@echo ""
 	@echo "  ✔ ビルド完了: $(TARGET)  [platform=$(PLATFORM), cc=$(CC)]"
