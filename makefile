@@ -93,7 +93,11 @@ zig-linux:
 # ---------- ビルド実体 ----------
 $(TARGET): $(SRC)
 ifeq ($(PLATFORM),windows)
+ifdef DEBUG
 	zig build -Dtarget=x86_64-windows-gnu
+else
+	zig build -Dtarget=x86_64-windows-gnu --release=small
+endif
 	@echo ""
 	@echo "  ✔ Windows向けビルド完了: $(TARGET)"
 	@echo ""
