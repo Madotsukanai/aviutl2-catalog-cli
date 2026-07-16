@@ -49,7 +49,7 @@ static void safe_strcat(char *dst, size_t dst_sz, const char *src) {
 #endif
 
 /* ===== 定数 ===== */
-#define AU2CAT_VERSION "v0.1.2"
+#define AU2CAT_VERSION "v0.1.3"
 #define INDEX_URL    "https://raw.githubusercontent.com/Neosku/aviutl2-catalog-data/main/index.json"
 #define CACHE_FILE   "au2cat_cache.json"   /* ホームディレクトリ内 */
 #define CACHE_TTL    1800                  /* 30分 (秒) */
@@ -2027,10 +2027,13 @@ static void check_cli_update(void) {
         if(p) {
             p = strchr(p, ':');
             if(p) {
+                p++;
                 p = (char*)skip_ws(p);
                 char tag[64];
                 if(parse_str(p, tag, sizeof(tag))) {
-                    if(strcmp(tag, AU2CAT_VERSION) != 0) {
+                    const char *v_tag = tag[0] == 'v' || tag[0] == 'V' ? tag + 1 : tag;
+                    const char *v_cur = AU2CAT_VERSION[0] == 'v' || AU2CAT_VERSION[0] == 'V' ? AU2CAT_VERSION + 1 : AU2CAT_VERSION;
+                    if(strcmp(v_tag, v_cur) != 0) {
                         C(36); printf("\n:: "); C_RESET;
                         printf(_("au2cat 本体の新しいバージョンが利用可能です: %s (現在: %s)\n"), tag, AU2CAT_VERSION);
                         printf(_("   'au2cat upgrade' で本体を更新できます。\n\n"));
