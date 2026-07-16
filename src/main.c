@@ -43,11 +43,14 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
-#ifdef _WIN32
-#include <windows.h>
-#else
 #include <sys/stat.h>
 #include <sys/types.h>
+#ifdef _WIN32
+#include <windows.h>
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
+#endif
+#else
 #include <unistd.h>
 #endif
 

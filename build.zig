@@ -22,6 +22,7 @@ pub fn build(b: *std.Build) !void {
             "-DWITH_GZFILEOP",
             "-Wno-unused-parameter",
             "-DCURL_STATICLIB",
+            "-Wno-format-security",
         },
     });
 
